@@ -122,6 +122,14 @@ async def test_generate_resumes_aborted_request_after_gate_reopens():
     assert out["response_ids"] == [10, 11, 12]
     assert out["response_logprobs"] == [-0.1, -0.2, -0.3]
     assert out["stop_reason"] == "stop"
+    # One abort held: 2 tokens in the aborted segment, prompt (2) + generated (2) re-prefilled.
+    assert client.pop_resume_stats() == {
+        "aborted_requests": 1,
+        "aborted_segment_tokens": 2,
+        "resume_prefill_tokens": 4,
+        "retried_503": 0,
+    }
+    assert client.pop_resume_stats()["aborted_requests"] == 0, "popping resets the counters"
 
 
 @pytest.mark.asyncio

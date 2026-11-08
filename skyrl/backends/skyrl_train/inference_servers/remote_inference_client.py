@@ -553,6 +553,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # Set while the engines accept requests; cleared by an aborting pause and set again on resume/wake.
     _generation_gate: Optional[asyncio.Event] = field(default=None, repr=False)
     _gate_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
+    # Hold-and-resume counters since the last `pop_resume_stats` (see `resume_aborted_requests`).
+    _resume_stats: Dict[str, int] = field(default_factory=dict, repr=False)
     _world_size: Optional[Tuple[int, int]] = field(default=None, repr=False)
     _gen_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _detok_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
@@ -836,6 +838,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             except InferenceServerHTTPError as exc:
                 if exc.status != 503:
                     raise
+                self._count_resume_stat("retried_503")
                 # A paused engine rejects new requests with 503. Either the gate is already closed
                 # (the loop waits on it) or the request raced the pause call; back off and go around.
                 if self._get_generation_gate().is_set():
@@ -846,6 +849,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 generated_logprobs.extend(result.response_logprobs)
             if result.stop_reason != "abort":
                 break
+            self._count_resume_stat("aborted_requests")
+            self._count_resume_stat("aborted_segment_tokens", len(result.response_ids))
+            # The resubmission re-prefills prompt + everything generated so far (sleep drops the KV).
+            self._count_resume_stat("resume_prefill_tokens", len(prompt_token_ids) + len(generated_ids))
             if max_tokens is not None:
                 remaining = max_tokens - len(generated_ids)
                 if remaining <= 0:
@@ -859,6 +866,18 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 response_logprobs=generated_logprobs if result.response_logprobs is not None else None,
             )
         )
+
+    def _count_resume_stat(self, key: str, n: int = 1) -> None:
+        self._resume_stats[key] = self._resume_stats.get(key, 0) + n
+
+    def pop_resume_stats(self) -> Dict[str, int]:
+        """Return and reset the hold-and-resume counters: ``aborted_requests`` (requests the engine
+        aborted and the client held), ``aborted_segment_tokens`` (tokens those requests had generated
+        in the aborted segment), ``resume_prefill_tokens`` (prompt + generated tokens re-prefilled on
+        resubmission) and ``retried_503`` (requests rejected by a paused engine and retried)."""
+        stats = {k: self._resume_stats.get(k, 0) for k in ("aborted_requests", "aborted_segment_tokens", "resume_prefill_tokens", "retried_503")}
+        self._resume_stats.clear()
+        return stats
 
     async def _generate_once(
         self,

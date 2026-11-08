@@ -65,9 +65,13 @@ class PartialRolloutRayPPOTrainer(StreamingRayPPOTrainerBase):
         # Abort the in-flight requests (the client holds them) and free the GPUs for training.
         await self.inference_engine_client.sleep()
 
-    # `_sync_weights_after_training_step` is inherited: with colocate_all the dispatch wakes the
-    # weights, broadcasts, and wakes the KV cache, which resumes the engines and releases the held
-    # requests.
+    async def _sync_weights_after_training_step(self) -> None:
+        # Inherited transfer: with colocate_all the dispatch wakes the weights, broadcasts, and wakes
+        # the KV cache, which resumes the engines and releases the held requests.
+        await super()._sync_weights_after_training_step()
+        # By now every request this step's cut aborted has come back to the client and is held.
+        stats = self.inference_engine_client.pop_resume_stats()
+        self.all_metrics.update({f"partial_rollout/{k}": v for k, v in stats.items()})
 
     async def _after_training_loop(self) -> None:
         await self.inference_engine_client.sleep()
