@@ -336,6 +336,8 @@ To address this, our `StreamingDataloader` records the data UIDs that have been 
 
 So `1 - policy_mini_batch_size / num_parallel_generation_workers` of the in-flight groups are cut per step, and a group's staleness is the number of cuts it survived (`async/staleness_*`). Tokens produced before a cut carry the older policy's rollout logprobs, so use a rollout-logprob loss (`rollout_is`, `dppo`, ...) as for fully async training. The admission controller is `AsyncStalenessManager` with `max_staleness_steps=None`: it admits at most `num_parallel_generation_workers` groups that are not yet trained on, and it never blocks a resumed group. See `examples/train/partial_rollout/partial_rollout_run_gsm8k.sh`.
 
+`trainer.fully_async.stale_group_policy` selects what happens to a group that reaches `max_staleness_steps` cuts. `ignore` (the default) trains on it and logs a warning. `wait` delays the next cut until every such group has finished, so that step waits for their tails. `drop` does not resume such a group: the client returns its request with stop reason `abort`, the trainer discards the group, and the prompt is not drawn again in this epoch. `wait` keeps every prompt, but one step can take as long as the longest trajectory. `drop` keeps the step short, but loses the prompt and the tokens spent on it. The step logs `partial_rollout/stale_groups_waited`, `partial_rollout/stale_groups_dropped` and `partial_rollout/not_resumed_requests`.
+
 ## VI. Future Work
 
 - Validate with correct algorithmic offset (importance weighting)

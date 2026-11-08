@@ -551,6 +551,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
     by default: the other trainers never abort in-flight requests, or they want ``abort`` reported as
     the stop reason."""
 
+    max_resumes_per_request: Optional[int] = None
+    """The number of times the client resubmits one held request. ``None`` means no limit. When a
+    request is aborted once more than this, the client returns it with stop reason ``abort`` and the
+    tokens generated so far. The colocated partial-rollout trainer sets it to ``max_staleness_steps``
+    under ``stale_group_policy="drop"``. Only used with ``resume_aborted_requests``."""
+
     # Private fields excluded from repr for cleaner output
     _generate_client: Optional[RemoteGenerateClient] = field(default=None, repr=False)
     # Set while the inference engines accept requests. An aborting pause clears it. Resume or wake sets it.
@@ -827,6 +833,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         generated_logprobs: List[float] = []
         request_params = dict(sampling_params)
         max_tokens = request_params.get("max_tokens")
+        aborts = 0
         while True:
             await self._get_generation_gate().wait()
             try:
@@ -856,17 +863,23 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 generated_logprobs.extend(result.response_logprobs)
             if result.stop_reason != "abort":
                 break
+            aborts += 1
             self._count_resume_stat("aborted_requests")
             self._count_resume_stat("aborted_segment_tokens", len(result.response_ids))
-            # The resubmission re-prefills the prompt and all tokens generated so far, because sleep
-            # drops the KV cache.
-            self._count_resume_stat("resume_prefill_tokens", len(prompt_token_ids) + len(generated_ids))
+            if self.max_resumes_per_request is not None and aborts > self.max_resumes_per_request:
+                # The request reached its resume budget. Return it with stop reason "abort" so the
+                # caller can drop it.
+                self._count_resume_stat("not_resumed_requests")
+                break
             if max_tokens is not None:
                 remaining = max_tokens - len(generated_ids)
                 if remaining <= 0:
                     result = replace(result, stop_reason="length")
                     break
                 request_params["max_tokens"] = remaining
+            # The resubmission re-prefills the prompt and all tokens generated so far, because sleep
+            # drops the KV cache.
+            self._count_resume_stat("resume_prefill_tokens", len(prompt_token_ids) + len(generated_ids))
         return self._generate_result_to_dict(
             replace(
                 result,
@@ -884,10 +897,18 @@ class RemoteInferenceClient(InferenceEngineInterface):
         - ``aborted_requests``: requests that the engine aborted and the client held.
         - ``aborted_segment_tokens``: tokens that those requests generated in the aborted segment.
         - ``resume_prefill_tokens``: prompt and generated tokens that the resubmission re-prefilled.
-        - ``retried_503``: requests that a paused engine rejected and the client retried."""
+        - ``retried_503``: requests that a paused engine rejected and the client retried.
+        - ``not_resumed_requests``: requests returned with stop reason ``abort`` because they reached
+          ``max_resumes_per_request``."""
         stats = {
             k: self._resume_stats.get(k, 0)
-            for k in ("aborted_requests", "aborted_segment_tokens", "resume_prefill_tokens", "retried_503")
+            for k in (
+                "aborted_requests",
+                "aborted_segment_tokens",
+                "resume_prefill_tokens",
+                "retried_503",
+                "not_resumed_requests",
+            )
         }
         self._resume_stats.clear()
         return stats
