@@ -20,6 +20,8 @@ bookkeeping. A subclass supplies the policy that does depend on it through a few
 - :meth:`_sync_weights_after_training_step`: the weight-sync bracket (default: pause,
   broadcast, resume); a colocated subclass wakes the engines and resubmits held requests.
 - :meth:`_after_training_loop`: engine teardown once training is done.
+- :attr:`checkpoint_before_weight_sync`: whether the step's checkpoint is written before the weight
+  sync (while colocated engines are still asleep and the trainer owns the GPUs) or after eval.
 
 High-level notes:
 - The global_step in each training loop iteration denotes the "current step being worked on", so
@@ -113,6 +115,10 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
     """Streams rollouts one group at a time through ``num_parallel_generation_workers`` workers and
     trains on every ``policy_mini_batch_size`` completed groups. Not a trainer by itself: see the module
     docstring for the hooks a subclass implements. Reads its knobs from ``trainer.fully_async``."""
+
+    checkpoint_before_weight_sync: bool = False
+    """Write the step's checkpoint before the weight sync instead of after eval. A colocated trainer
+    sets this: the checkpoint backloads the policy to GPU, which must happen while the engines sleep."""
 
     def __init__(self, *args, **kwargs):
         # Extract cfg before base init so we can initialize async-specific knobs used by our overrides.
@@ -504,11 +510,14 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
             self._training_control.should_save = False
             self._training_control.should_evaluate = False
 
+            # A training step completed: count it for this epoch's bookkeeping.
+            trained_steps_this_epoch = trained_steps_before + 1
+            is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
+            if self.checkpoint_before_weight_sync:
+                await self._save_step_checkpoints(force_save, is_epoch_end)
+
             # 4. After training: pause generation, sync weights, resume.
             await self._sync_weights_after_training_step()
-
-        # A training step completed: count it for this epoch's bookkeeping.
-        trained_steps_this_epoch = trained_steps_before + 1
 
         # One profiler step per async global step.
         self._profiler_step()
@@ -531,20 +540,8 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
             self._fire("on_eval_end", metrics=eval_metrics)
 
         # 7. Checkpointing. At interval, at the last step of each epoch, and when a callback asks.
-        is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
-        ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
-            is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
-        )
-        if force_save or ckpt_interval_save:
-            async with self._step_deadline():
-                with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                    ckpt_path = await asyncio.to_thread(self.save_checkpoints)
-            self._fire("on_save", ckpt_path=ckpt_path)
-        if self.cfg.trainer.hf_save_interval > 0:
-            if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
-                async with self._step_deadline():
-                    with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
-                        await asyncio.to_thread(self.save_models)
+        if not self.checkpoint_before_weight_sync:
+            await self._save_step_checkpoints(force_save, is_epoch_end)
 
         log_payload = {**self.all_metrics, **{"timing/" + k: v for k, v in self.all_timings.items()}}
         if self._ray_gpu_monitor is not None:
@@ -572,6 +569,23 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
             f"{actual_trained_in_epoch} != {expected_trained_in_epoch}"
         )
         return _StepOutcome.CONTINUE
+
+    async def _save_step_checkpoints(self, force_save: bool, is_epoch_end: bool) -> None:
+        """The step's checkpoint and HF export, each at its interval, at the last step of the epoch, or
+        when a callback asked for a save."""
+        ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
+            is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
+        )
+        if force_save or ckpt_interval_save:
+            async with self._step_deadline():
+                with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
+                    ckpt_path = await asyncio.to_thread(self.save_checkpoints)
+            self._fire("on_save", ckpt_path=ckpt_path)
+        if self.cfg.trainer.hf_save_interval > 0:
+            if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
+                async with self._step_deadline():
+                    with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
+                        await asyncio.to_thread(self.save_models)
 
     async def _discard_partial_epoch_end_batch(self, partial_batch: List[GeneratedOutputGroup], epoch: int) -> None:
         """Exhausted mid mini-batch under ``sample_full_batch``: discard the partial batch (marked consumed
