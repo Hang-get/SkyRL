@@ -334,7 +334,7 @@ To address this, our `StreamingDataloader` records the data UIDs that have been 
 2. The trainer runs on the finished groups and writes the step's checkpoint while the engines sleep.
 3. The weight sync wakes the engines with the new weights, and the held requests continue from `prompt + generated` under the new policy. The engines rebuild the KV cache for the resumed prefix.
 
-So `1 - policy_mini_batch_size / num_parallel_generation_workers` of the in-flight groups are cut per step, and a group's staleness is the number of cuts it survived (`async/staleness_*`). Tokens produced before a cut carry the older policy's rollout logprobs, so use a rollout-logprob loss (`rollout_is`, `dppo`, ...) as for fully async training. `max_staleness_steps` is not enforced here: resumed groups are already paid for and are never blocked. See `examples/train/partial_rollout/partial_rollout_run_gsm8k.sh`.
+So `1 - policy_mini_batch_size / num_parallel_generation_workers` of the in-flight groups are cut per step, and a group's staleness is the number of cuts it survived (`async/staleness_*`). Tokens produced before a cut carry the older policy's rollout logprobs, so use a rollout-logprob loss (`rollout_is`, `dppo`, ...) as for fully async training. The admission controller is `AsyncStalenessManager` with `max_staleness_steps=None`: it admits at most `num_parallel_generation_workers` groups that are not yet trained on, and it never blocks a resumed group. See `examples/train/partial_rollout/partial_rollout_run_gsm8k.sh`.
 
 ## VI. Future Work
 

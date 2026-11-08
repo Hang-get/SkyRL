@@ -13,7 +13,6 @@ A group is one prompt generated ``n_samples_per_prompt`` times.
 
 from skyrl.train.streaming.admission import (
     AsyncStalenessManager,
-    ConcurrencyAdmissionController,
     RolloutAdmissionController,
     RolloutStat,
 )
@@ -26,7 +25,6 @@ from skyrl.train.streaming.trainer import FullyAsyncRayPPOTrainer
 __all__ = [
     "StreamingDataloader",
     "AsyncStalenessManager",
-    "ConcurrencyAdmissionController",
     "StreamingRayPPOTrainerBase",
     "FullyAsyncRayPPOTrainer",
     "GeneratedOutputGroup",

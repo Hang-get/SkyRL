@@ -22,7 +22,7 @@ logprobs of the older policy. The loss must use rollout logprobs, and the base c
 from loguru import logger
 
 from skyrl.train.streaming.admission import (
-    ConcurrencyAdmissionController,
+    AsyncStalenessManager,
     RolloutAdmissionController,
 )
 from skyrl.train.streaming.base import StreamingRayPPOTrainerBase
@@ -44,9 +44,11 @@ class PartialRolloutRayPPOTrainer(StreamingRayPPOTrainerBase):
         return self.num_parallel_generation_workers
 
     def _build_admission_controller(self) -> RolloutAdmissionController:
-        return ConcurrencyAdmissionController(
-            max_concurrent_groups=self.num_parallel_generation_workers,
+        # No staleness term: the cut bounds the staleness, and a resumed group already holds its slot.
+        return AsyncStalenessManager(
+            max_concurrent_generation_groups=self.num_parallel_generation_workers,
             mini_batch_size=self.mini_batch_size,
+            max_staleness_steps=None,
         )
 
     def _validate_mode_config(self) -> None:

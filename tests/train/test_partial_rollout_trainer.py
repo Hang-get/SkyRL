@@ -15,7 +15,7 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
     RemoteInferenceClient,
 )
 from skyrl.train.streaming import (
-    ConcurrencyAdmissionController,
+    AsyncStalenessManager,
     PartialRolloutRayPPOTrainer,
 )
 from tests.train.test_rl_callbacks import (
@@ -27,18 +27,18 @@ from tests.train.test_rl_callbacks import (
 )
 
 # ---------------------------------------------------------------------------
-# ConcurrencyAdmissionController
+# AsyncStalenessManager without a staleness term
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_concurrency_admission_holds_slot_until_trained():
+async def test_admission_without_staleness_holds_slot_until_trained():
     """A group holds its slot from submission until the step that trains on it.
 
     A finished group that waits in the buffer still holds its slot. So running + buffered never exceeds
     the in-flight bound, which is also the buffer size, and the cut fraction is
     1 - mini_batch / in_flight. There is no staleness term."""
-    ctrl = ConcurrencyAdmissionController(max_concurrent_groups=3, mini_batch_size=2)
+    ctrl = AsyncStalenessManager(max_concurrent_generation_groups=3, mini_batch_size=2, max_staleness_steps=None)
     for _ in range(3):
         await ctrl.acquire_submission_slot()
     fourth = asyncio.create_task(ctrl.acquire_submission_slot())

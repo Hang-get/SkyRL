@@ -4,13 +4,15 @@ A generation worker acquires a slot from a :class:`RolloutAdmissionController` b
 group to the inference engines. The controller decides when generation may run ahead of training.
 This decision is the only policy that differs between the streaming trainers. The fully-async
 trainer uses a staleness budget (:class:`AsyncStalenessManager`). The colocated partial-rollout
-trainer uses a concurrency bound (:class:`ConcurrencyAdmissionController`). The worker tasks, the
-buffer, the mini-batch collection and the checkpointing are shared.
+trainer uses the same controller with ``max_staleness_steps=None``, which bounds only the number of
+untrained groups. The worker tasks, the buffer, the mini-batch collection and the checkpointing are
+shared.
 """
 
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -102,12 +104,20 @@ class AsyncStalenessManager(RolloutAdmissionController):
     The key capacity formula is implemented in `_compute_capacity_unlocked`. For details and caveats,
     see https://docs.skyrl.ai/docs/tutorials/fully_async#async-staleness-manager.
 
+    With ``max_staleness_steps=None`` the controller has no staleness term. It admits a group while
+    fewer than ``max_concurrent_generation_groups`` groups are not yet trained on. A finished group
+    that waits in the buffer still holds its slot. The colocated partial-rollout trainer uses this
+    mode: it cuts generation when ``mini_batch_size`` groups have finished and resumes the cut groups
+    under the new weights, so a resumed group already holds a slot and is never blocked. The cut
+    itself bounds the staleness: a group survives at most
+    ``ceil(trajectory_length / tokens_per_cut)`` cuts.
+
     Reference:
     - Modeled after AReal's StalenessManager: https://github.com/inclusionAI/AReaL/blob/b755c4447c2fff97889d8828293ee85f17a806f9/areal/core/staleness_manager.py
     - The idea of this controller is from section 5.1 of AReal's paper: https://arxiv.org/pdf/2505.24298v3
     """
 
-    def __init__(self, max_concurrent_generation_groups: int, mini_batch_size: int, max_staleness_steps: int):
+    def __init__(self, max_concurrent_generation_groups: int, mini_batch_size: int, max_staleness_steps: Optional[int]):
         self.max_concurrent_generation_groups = max_concurrent_generation_groups
         self.mini_batch_size = mini_batch_size
         self.max_staleness_steps = max_staleness_steps
@@ -154,7 +164,14 @@ class AsyncStalenessManager(RolloutAdmissionController):
     def _compute_capacity_unlocked(self) -> int:
         # NOTE(Charlie): do not need a self._current_global_step + 1 here unlike AReal because our
         # `_current_global_step` is "the version being worked on", not already finished steps.
-        consumer_capacity = (self.max_staleness_steps + self._current_global_step) * self.mini_batch_size
+        if self.max_staleness_steps is None:
+            # No staleness term: at most `max_concurrent_generation_groups` groups are not yet trained
+            # on. The steps before `_current_global_step` consumed `mini_batch_size` groups each.
+            consumer_capacity = (
+                self._current_global_step - 1
+            ) * self.mini_batch_size + self.max_concurrent_generation_groups
+        else:
+            consumer_capacity = (self.max_staleness_steps + self._current_global_step) * self.mini_batch_size
         producer_staleness_capacity = consumer_capacity - (self._stat.accepted + self._stat.running)
         producer_concurrency_capacity = self.max_concurrent_generation_groups - self._stat.running
         return min(producer_concurrency_capacity, producer_staleness_capacity)
@@ -202,86 +219,6 @@ class AsyncStalenessManager(RolloutAdmissionController):
 
     async def notify_capacity_change(self, new_global_step: int) -> None:
         # Called when current_global_step changes (e.g., after a training step)
-        async with self._cond:
-            self._current_global_step = int(new_global_step)
-            self._cond.notify_all()
-
-
-class ConcurrencyAdmissionController(RolloutAdmissionController):
-    """The admission controller of the colocated partial-rollout trainer.
-
-    The controller admits at most ``max_concurrent_groups`` groups that are not yet trained on. It has
-    no staleness bound. Partial rollout cuts generation when ``mini_batch_size`` groups have finished,
-    trains, and resumes the cut groups under the new weights. A resumed group already holds a slot, so
-    the controller never blocks it.
-
-    A group holds its slot from submission until the step that trains on it
-    (``notify_capacity_change``). A finished group that waits in the buffer still holds its slot. If
-    the slot became free when generation finished, the workers would admit new groups past the cut.
-    The cut fraction would then differ from ``1 - mini_batch_size / max_concurrent_groups``, and the
-    finished groups could overflow the buffer of size ``max_concurrent_groups``.
-
-    The cut itself bounds the staleness. A group survives at most
-    ``ceil(trajectory_length / tokens_per_cut)`` cuts. The per-step staleness metrics report it.
-    """
-
-    def __init__(self, max_concurrent_groups: int, mini_batch_size: int):
-        self.max_concurrent_groups = max_concurrent_groups
-        self.mini_batch_size = mini_batch_size
-        self._stat = RolloutStat()
-        self._cond = asyncio.Condition()
-        self._current_global_step = 1
-
-    def load_state_from_checkpoint(self, global_step: int) -> None:
-        self._current_global_step = global_step
-        self._stat.accepted = (global_step - 1) * self.mini_batch_size
-        self._stat.submitted = self._stat.accepted
-
-    async def validate_state_at_epoch_end(self, global_step: int) -> None:
-        async with self._cond:
-            assert self._stat.running == 0, "We expect no rollouts are running at end of an epoch."
-            consumed = (global_step - 1) * self.mini_batch_size
-            assert (
-                self._stat.accepted == consumed
-            ), f"Unexpected number of accepted rollouts. Got {self._stat.accepted} != {consumed}."
-            assert self._stat.submitted == self._stat.accepted + self._stat.filtered, (
-                "We expect all submitted rollouts to be accepted or filtered at end of an epoch. "
-                f"Got {self._stat.submitted} != {self._stat.accepted} + {self._stat.filtered}."
-            )
-
-    def _untrained_groups_unlocked(self) -> int:
-        # Count the running groups plus the finished groups that are not yet trained on. A finished
-        # group is in the buffer or in the mini-batch under collection. Each step before
-        # `_current_global_step` consumed `mini_batch_size` groups.
-        consumed = (self._current_global_step - 1) * self.mini_batch_size
-        return self._stat.running + self._stat.accepted - consumed
-
-    async def acquire_submission_slot(self) -> None:
-        async with self._cond:
-            while self._untrained_groups_unlocked() >= self.max_concurrent_groups:
-                await self._cond.wait()
-            self._stat.submitted += 1
-            self._stat.running += 1
-
-    async def on_rollout_accepted(self) -> None:
-        # The group moves from running to the buffer. It holds its slot until a step trains on it.
-        async with self._cond:
-            self._stat.accepted += 1
-            self._stat.running -= 1
-            self._cond.notify_all()
-
-    async def on_rollout_filtered(self) -> None:
-        async with self._cond:
-            self._stat.accepted -= 1
-            self._stat.filtered += 1
-            self._cond.notify_all()
-
-    async def on_rollout_rejected(self) -> None:
-        async with self._cond:
-            self._stat.running -= 1
-            self._cond.notify_all()
-
-    async def notify_capacity_change(self, new_global_step: int) -> None:
         async with self._cond:
             self._current_global_step = int(new_global_step)
             self._cond.notify_all()
