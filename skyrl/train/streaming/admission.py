@@ -205,3 +205,68 @@ class AsyncStalenessManager(RolloutAdmissionController):
         async with self._cond:
             self._current_global_step = int(new_global_step)
             self._cond.notify_all()
+
+
+class ConcurrencyAdmissionController(RolloutAdmissionController):
+    """Admission for colocated partial rollout: at most ``max_concurrent_groups`` groups in flight,
+    and no staleness bound.
+
+    Partial rollout cuts generation when ``mini_batch_size`` groups have finished, trains, and resumes
+    the groups that were in flight under the new weights. Those resumed groups are already paid for,
+    so they are never blocked; a new group is admitted whenever a slot is free. Staleness is bounded by
+    the cut itself: a group can survive at most ``ceil(trajectory_length / tokens_per_cut)`` cuts, and
+    the per-step staleness metrics report it.
+    """
+
+    def __init__(self, max_concurrent_groups: int, mini_batch_size: int):
+        self.max_concurrent_groups = max_concurrent_groups
+        self.mini_batch_size = mini_batch_size
+        self._stat = RolloutStat()
+        self._cond = asyncio.Condition()
+        self._current_global_step = 1
+
+    def load_state_from_checkpoint(self, global_step: int) -> None:
+        self._current_global_step = global_step
+        self._stat.accepted = (global_step - 1) * self.mini_batch_size
+        self._stat.submitted = self._stat.accepted
+
+    async def validate_state_at_epoch_end(self, global_step: int) -> None:
+        async with self._cond:
+            assert self._stat.running == 0, "We expect no rollouts are running at end of an epoch."
+            consumed = (global_step - 1) * self.mini_batch_size
+            assert (
+                self._stat.accepted == consumed
+            ), f"Unexpected number of accepted rollouts. Got {self._stat.accepted} != {consumed}."
+            assert self._stat.submitted == self._stat.accepted + self._stat.filtered, (
+                "We expect all submitted rollouts to be accepted or filtered at end of an epoch. "
+                f"Got {self._stat.submitted} != {self._stat.accepted} + {self._stat.filtered}."
+            )
+
+    async def acquire_submission_slot(self) -> None:
+        async with self._cond:
+            while self._stat.running >= self.max_concurrent_groups:
+                await self._cond.wait()
+            self._stat.submitted += 1
+            self._stat.running += 1
+
+    async def on_rollout_accepted(self) -> None:
+        async with self._cond:
+            self._stat.accepted += 1
+            self._stat.running -= 1
+            self._cond.notify_all()
+
+    async def on_rollout_filtered(self) -> None:
+        async with self._cond:
+            self._stat.accepted -= 1
+            self._stat.filtered += 1
+            self._cond.notify_all()
+
+    async def on_rollout_rejected(self) -> None:
+        async with self._cond:
+            self._stat.running -= 1
+            self._cond.notify_all()
+
+    async def notify_capacity_change(self, new_global_step: int) -> None:
+        async with self._cond:
+            self._current_global_step = int(new_global_step)
+            self._cond.notify_all()

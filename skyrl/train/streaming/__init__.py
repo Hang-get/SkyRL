@@ -7,26 +7,30 @@ A group is one prompt generated ``n_samples_per_prompt`` times.
   on where the inference engines run.
 - :class:`FullyAsyncRayPPOTrainer` runs the inference engines on their own GPUs. Generation never
   stops. :class:`AsyncStalenessManager` bounds how far generation runs ahead of training.
-- A colocated partial-rollout trainer is the planned second subclass. It cuts generation when the
-  mini-batch is full and resumes the cut groups under the new weights.
+- :class:`PartialRolloutRayPPOTrainer` runs the inference engines on the trainer GPUs. It cuts
+  generation when the mini-batch is full, trains, and resumes the cut groups under the new weights.
 """
 
 from skyrl.train.streaming.admission import (
     AsyncStalenessManager,
+    ConcurrencyAdmissionController,
     RolloutAdmissionController,
     RolloutStat,
 )
 from skyrl.train.streaming.base import StreamingRayPPOTrainerBase
 from skyrl.train.streaming.dataloader import StreamingDataloader
 from skyrl.train.streaming.group import GeneratedOutputGroup
+from skyrl.train.streaming.partial_rollout import PartialRolloutRayPPOTrainer
 from skyrl.train.streaming.trainer import FullyAsyncRayPPOTrainer
 
 __all__ = [
     "StreamingDataloader",
     "AsyncStalenessManager",
+    "ConcurrencyAdmissionController",
     "StreamingRayPPOTrainerBase",
     "FullyAsyncRayPPOTrainer",
     "GeneratedOutputGroup",
+    "PartialRolloutRayPPOTrainer",
     "RolloutAdmissionController",
     "RolloutStat",
 ]
