@@ -30,22 +30,38 @@ from tests.train.test_rl_callbacks import (
 
 
 @pytest.mark.asyncio
-async def test_concurrency_admission_blocks_at_capacity_only():
-    """Slots are bounded by the in-flight count alone: no staleness term, and a finished group frees a
-    slot immediately."""
-    ctrl = ConcurrencyAdmissionController(max_concurrent_groups=2, mini_batch_size=1)
-    await ctrl.acquire_submission_slot()
-    await ctrl.acquire_submission_slot()
-    third = asyncio.create_task(ctrl.acquire_submission_slot())
+async def test_concurrency_admission_holds_slot_until_trained():
+    """A slot is held from submission until the step that trains on the group: a finished group waiting
+    in the buffer still counts, so running + buffered never exceeds the in-flight bound (the buffer is
+    sized to it) and the cut fraction is 1 - mini_batch / in_flight. No staleness term."""
+    ctrl = ConcurrencyAdmissionController(max_concurrent_groups=3, mini_batch_size=2)
+    for _ in range(3):
+        await ctrl.acquire_submission_slot()
+    fourth = asyncio.create_task(ctrl.acquire_submission_slot())
     await asyncio.sleep(0)
-    assert not third.done()
-    await ctrl.on_rollout_accepted()
-    await asyncio.wait_for(third, timeout=1)
-    # Advancing the policy version never blocks or unblocks anything.
-    await ctrl.notify_capacity_change(10)
+    assert not fourth.done()
+    # Finishing generation does not free the slot: the group is buffered, not trained.
     await ctrl.on_rollout_accepted()
     await ctrl.on_rollout_accepted()
-    await ctrl.validate_state_at_epoch_end(global_step=4)
+    await asyncio.sleep(0)
+    assert not fourth.done()
+    # Training step 1 consumed 2 groups: two slots free up.
+    await ctrl.notify_capacity_change(2)
+    await asyncio.wait_for(fourth, timeout=1)
+    await ctrl.acquire_submission_slot()
+    sixth = asyncio.create_task(ctrl.acquire_submission_slot())
+    await asyncio.sleep(0)
+    assert not sixth.done()
+    # A filtered (dropped) group leaves the buffer and frees its slot.
+    await ctrl.on_rollout_accepted()
+    await ctrl.on_rollout_filtered()
+    await asyncio.wait_for(sixth, timeout=1)
+    for _ in range(3):
+        await ctrl.on_rollout_accepted()
+    await ctrl.on_rollout_filtered()
+    # 6 submitted = 4 trained (steps 1, 2) + 2 filtered.
+    await ctrl.notify_capacity_change(3)
+    await ctrl.validate_state_at_epoch_end(global_step=3)
 
 
 # ---------------------------------------------------------------------------

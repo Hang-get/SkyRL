@@ -208,14 +208,17 @@ class AsyncStalenessManager(RolloutAdmissionController):
 
 
 class ConcurrencyAdmissionController(RolloutAdmissionController):
-    """Admission for colocated partial rollout: at most ``max_concurrent_groups`` groups in flight,
-    and no staleness bound.
+    """Admission for colocated partial rollout: at most ``max_concurrent_groups`` groups admitted and
+    not yet trained on, and no staleness bound.
 
     Partial rollout cuts generation when ``mini_batch_size`` groups have finished, trains, and resumes
     the groups that were in flight under the new weights. Those resumed groups are already paid for,
-    so they are never blocked; a new group is admitted whenever a slot is free. Staleness is bounded by
-    the cut itself: a group can survive at most ``ceil(trajectory_length / tokens_per_cut)`` cuts, and
-    the per-step staleness metrics report it.
+    so they are never blocked. A group holds its slot from submission until the step that trains on it
+    (``notify_capacity_change``), not just until it finishes generating: a finished group waiting in the
+    buffer still counts. Otherwise workers keep admitting new groups past the cut, so the cut fraction
+    is not ``1 - mini_batch_size / max_concurrent_groups`` and finished groups can overflow the buffer
+    (sized ``max_concurrent_groups``). Staleness is bounded by the cut itself: a group can survive at
+    most ``ceil(trajectory_length / tokens_per_cut)`` cuts, and the per-step staleness metrics report it.
     """
 
     def __init__(self, max_concurrent_groups: int, mini_batch_size: int):
@@ -242,14 +245,21 @@ class ConcurrencyAdmissionController(RolloutAdmissionController):
                 f"Got {self._stat.submitted} != {self._stat.accepted} + {self._stat.filtered}."
             )
 
+    def _untrained_groups_unlocked(self) -> int:
+        # Running groups plus finished groups not yet trained on (in the buffer or in the mini-batch
+        # being collected). The steps before `_current_global_step` consumed `mini_batch_size` each.
+        consumed = (self._current_global_step - 1) * self.mini_batch_size
+        return self._stat.running + self._stat.accepted - consumed
+
     async def acquire_submission_slot(self) -> None:
         async with self._cond:
-            while self._stat.running >= self.max_concurrent_groups:
+            while self._untrained_groups_unlocked() >= self.max_concurrent_groups:
                 await self._cond.wait()
             self._stat.submitted += 1
             self._stat.running += 1
 
     async def on_rollout_accepted(self) -> None:
+        # The group moves from running to the buffer; its slot is held until it is trained on.
         async with self._cond:
             self._stat.accepted += 1
             self._stat.running -= 1
