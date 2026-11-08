@@ -1,5 +1,7 @@
-"""CPU tests for colocated partial rollout: the admission controller, the client's hold-and-resume of
-aborted requests, and the order of engine sleep, training, checkpoint and weight sync in one step."""
+"""CPU tests for colocated partial rollout.
+
+The tests cover the admission controller, the hold-and-resume of aborted requests in the client, and
+the order of engine sleep, training, checkpoint and weight sync in one step."""
 
 import asyncio
 from types import SimpleNamespace
@@ -31,9 +33,11 @@ from tests.train.test_rl_callbacks import (
 
 @pytest.mark.asyncio
 async def test_concurrency_admission_holds_slot_until_trained():
-    """A slot is held from submission until the step that trains on the group: a finished group waiting
-    in the buffer still counts, so running + buffered never exceeds the in-flight bound (the buffer is
-    sized to it) and the cut fraction is 1 - mini_batch / in_flight. No staleness term."""
+    """A group holds its slot from submission until the step that trains on it.
+
+    A finished group that waits in the buffer still holds its slot. So running + buffered never exceeds
+    the in-flight bound, which is also the buffer size, and the cut fraction is
+    1 - mini_batch / in_flight. There is no staleness term."""
     ctrl = ConcurrencyAdmissionController(max_concurrent_groups=3, mini_batch_size=2)
     for _ in range(3):
         await ctrl.acquire_submission_slot()
@@ -90,15 +94,17 @@ def _client(resume: bool) -> RemoteInferenceClient:
 
 @pytest.mark.asyncio
 async def test_generate_resumes_aborted_request_after_gate_reopens():
-    """An aborted request is resubmitted with its tokens appended and its token budget reduced, only
-    once the gate reopens; the caller sees one spliced completion."""
+    """The client resubmits an aborted request after the gate reopens.
+
+    The resubmission appends the generated tokens to the prompt and reduces the token budget. The
+    caller receives one spliced completion."""
     client = _client(resume=True)
     calls = []
 
     async def fake_generate(**kwargs):
         calls.append((list(kwargs["prompt_token_ids"]), dict(kwargs["sampling_params"])))
         if len(calls) == 1:
-            # The trainer's pause() closes the gate before the engine's abort output reaches us.
+            # The trainer's pause() closes the gate before the abort result from the engine arrives.
             client._close_generation_gate()
             return _result([10, 11], [-0.1, -0.2], "abort")
         return _result([12], [-0.3], "stop")
@@ -190,9 +196,11 @@ async def test_pause_and_wake_drive_the_gate():
 
 
 def test_partial_rollout_step_sleeps_trains_checkpoints_then_syncs(monkeypatch):
-    """Per step: engines sleep (aborting in-flight requests) before training, the checkpoint is written
-    while they sleep, and the weight sync (which wakes them) comes last. Same callback sequence as the
-    fully-async trainer otherwise."""
+    """One step runs sleep, train, checkpoint, weight sync, in this order.
+
+    The sleep aborts the in-flight requests before training. The trainer writes the checkpoint while
+    the engines sleep. The weight sync wakes the engines and comes last. The callback sequence is the
+    same as in the fully-async trainer."""
     cfg = _build_test_cfg()
     cfg.trainer.fully_async.enabled = True
     cfg.trainer.fully_async.num_parallel_generation_workers = 3
@@ -254,7 +262,7 @@ def test_partial_rollout_step_sleeps_trains_checkpoints_then_syncs(monkeypatch):
 
     asyncio.run(trainer.train())
 
-    # Initial sync, two steps, then the end-of-training sleep and final checkpoint.
+    # The order is: the initial sync, two steps, the sleep at the end of training, and the final checkpoint.
     assert order == [
         "sync",
         "sleep",

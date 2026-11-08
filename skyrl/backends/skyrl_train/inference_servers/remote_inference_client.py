@@ -542,18 +542,21 @@ class RemoteInferenceClient(InferenceEngineInterface):
     """Optional HF tokenizer for local tokenize/detokenize (avoids HTTP round-trips)."""
 
     resume_aborted_requests: bool = False
-    """Hold a ``generate`` call whose request the engine aborted (an ``abort``/``wait`` pause, or
-    ``sleep``) and resubmit it, with the tokens generated so far appended to the prompt, once the
-    engines are resumed. The caller then sees one completion that spans the pause. Used by colocated
-    partial rollout, where every training step aborts the in-flight requests. Off by default: the
-    other trainers either never abort in-flight requests or want ``abort`` surfaced as a stop reason."""
+    """Hold a ``generate`` call whose request the inference engine aborted, and resubmit it on resume.
+
+    An ``abort`` or ``wait`` pause and ``sleep`` abort the in-flight requests. The client keeps the
+    tokens generated so far. When the engines resume, the client resubmits the prompt plus those
+    tokens. The caller receives one completion that spans the pause. The colocated partial-rollout
+    trainer sets this flag, because each training step aborts the in-flight requests. The flag is off
+    by default: the other trainers never abort in-flight requests, or they want ``abort`` reported as
+    the stop reason."""
 
     # Private fields excluded from repr for cleaner output
     _generate_client: Optional[RemoteGenerateClient] = field(default=None, repr=False)
-    # Set while the engines accept requests; cleared by an aborting pause and set again on resume/wake.
+    # Set while the inference engines accept requests. An aborting pause clears it. Resume or wake sets it.
     _generation_gate: Optional[asyncio.Event] = field(default=None, repr=False)
     _gate_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
-    # Hold-and-resume counters since the last `pop_resume_stats` (see `resume_aborted_requests`).
+    # Hold-and-resume counters since the last `pop_resume_stats` call (see `resume_aborted_requests`).
     _resume_stats: Dict[str, int] = field(default_factory=dict, repr=False)
     _world_size: Optional[Tuple[int, int]] = field(default=None, repr=False)
     _gen_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
@@ -612,8 +615,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         return self._gen_sem, self._detok_sem
 
     def _get_generation_gate(self) -> asyncio.Event:
-        """The event that is set while the engines accept requests. Bound to the running loop, like
-        the semaphores; recreated (open) if the loop changed."""
+        """Return the event that is set while the inference engines accept requests.
+
+        The event is bound to the running loop, like the semaphores. If the loop changed, the client
+        creates a new event in the set state."""
         loop = asyncio.get_running_loop()
         if self._generation_gate is None or self._gate_loop is not loop:
             self._generation_gate = asyncio.Event()
@@ -808,10 +813,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
             )
             return self._generate_result_to_dict(result)
 
-        # Hold-and-resume: a request the engine aborts (pause/sleep) comes back with the tokens it
-        # produced so far and ``finish_reason == "abort"``. Keep them, wait until the engines are
-        # resumed, and continue from ``prompt + generated`` with the remaining token budget. The
-        # engines rebuild the KV cache for the resumed prefix, so the caller only pays re-prefill.
+        # Hold and resume. When the inference engine aborts a request (pause or sleep), the result
+        # holds the tokens generated so far and ``finish_reason == "abort"``. Keep those tokens. Wait
+        # until the engines resume. Then continue from ``prompt + generated`` with the remaining token
+        # budget. The engines rebuild the KV cache for the resumed prefix, so the caller only pays
+        # the re-prefill.
         if self.enable_return_routed_experts or return_sample_support:
             raise ValueError(
                 "resume_aborted_requests cannot splice per-token side channels (routed experts, "
@@ -840,7 +846,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     raise
                 self._count_resume_stat("retried_503")
                 # A paused engine rejects new requests with 503. Either the gate is already closed
-                # (the loop waits on it) or the request raced the pause call; back off and go around.
+                # and the loop waits on it, or this request raced the pause call. Wait a short time
+                # and retry.
                 if self._get_generation_gate().is_set():
                     await asyncio.sleep(0.5)
                 continue
@@ -851,7 +858,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 break
             self._count_resume_stat("aborted_requests")
             self._count_resume_stat("aborted_segment_tokens", len(result.response_ids))
-            # The resubmission re-prefills prompt + everything generated so far (sleep drops the KV).
+            # The resubmission re-prefills the prompt and all tokens generated so far, because sleep
+            # drops the KV cache.
             self._count_resume_stat("resume_prefill_tokens", len(prompt_token_ids) + len(generated_ids))
             if max_tokens is not None:
                 remaining = max_tokens - len(generated_ids)
@@ -871,10 +879,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
         self._resume_stats[key] = self._resume_stats.get(key, 0) + n
 
     def pop_resume_stats(self) -> Dict[str, int]:
-        """Return and reset the hold-and-resume counters: ``aborted_requests`` (requests the engine
-        aborted and the client held), ``aborted_segment_tokens`` (tokens those requests had generated
-        in the aborted segment), ``resume_prefill_tokens`` (prompt + generated tokens re-prefilled on
-        resubmission) and ``retried_503`` (requests rejected by a paused engine and retried)."""
+        """Return the hold-and-resume counters and reset them.
+
+        - ``aborted_requests``: requests that the engine aborted and the client held.
+        - ``aborted_segment_tokens``: tokens that those requests generated in the aborted segment.
+        - ``resume_prefill_tokens``: prompt and generated tokens that the resubmission re-prefilled.
+        - ``retried_503``: requests that a paused engine rejected and the client retried."""
         stats = {
             k: self._resume_stats.get(k, 0)
             for k in ("aborted_requests", "aborted_segment_tokens", "resume_prefill_tokens", "retried_503")
@@ -1395,8 +1405,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
         params: Dict[str, Any] = {"mode": mode.value, "clear_cache": str(clear_cache).lower()}
 
         if mode != PauseMode.KEEP:
-            # The engines reject new requests until resumed; hold them here instead (see
-            # ``resume_aborted_requests``). Closed before the call so no request slips in between.
+            # The engines reject new requests until resume. Hold the requests here instead (see
+            # ``resume_aborted_requests``). Close the gate before the call, so no request enters in
+            # between.
             self._close_generation_gate()
         return await self._call_all_servers("/pause", params=params)
 
@@ -1457,8 +1468,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
         params = {"tags": tags} if tags else {}
         ret = await self._call_all_servers("/wake_up", params=params)
         if not tags or "kv_cache" in tags:
-            # The KV cache is the last pool to wake; vLLM resumes its scheduler once every pool is
-            # resident, so requests held since the sleep may go out again.
+            # The KV cache is the last pool to wake. vLLM resumes its scheduler when every pool is
+            # resident. The held requests may go out again.
             self._open_generation_gate()
         return ret
 

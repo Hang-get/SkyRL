@@ -3,9 +3,9 @@
 A generation worker acquires a slot from a :class:`RolloutAdmissionController` before it submits a
 group to the inference engines. The controller decides when generation may run ahead of training.
 This decision is the only policy that differs between the streaming trainers. The fully-async
-trainer uses a staleness budget (:class:`AsyncStalenessManager`). A colocated partial-rollout
-trainer uses a cut fraction of the mini-batch. The worker tasks, the buffer, the mini-batch
-collection and the checkpointing are shared.
+trainer uses a staleness budget (:class:`AsyncStalenessManager`). The colocated partial-rollout
+trainer uses a concurrency bound (:class:`ConcurrencyAdmissionController`). The worker tasks, the
+buffer, the mini-batch collection and the checkpointing are shared.
 """
 
 import asyncio
@@ -208,17 +208,21 @@ class AsyncStalenessManager(RolloutAdmissionController):
 
 
 class ConcurrencyAdmissionController(RolloutAdmissionController):
-    """Admission for colocated partial rollout: at most ``max_concurrent_groups`` groups admitted and
-    not yet trained on, and no staleness bound.
+    """The admission controller of the colocated partial-rollout trainer.
 
-    Partial rollout cuts generation when ``mini_batch_size`` groups have finished, trains, and resumes
-    the groups that were in flight under the new weights. Those resumed groups are already paid for,
-    so they are never blocked. A group holds its slot from submission until the step that trains on it
-    (``notify_capacity_change``), not just until it finishes generating: a finished group waiting in the
-    buffer still counts. Otherwise workers keep admitting new groups past the cut, so the cut fraction
-    is not ``1 - mini_batch_size / max_concurrent_groups`` and finished groups can overflow the buffer
-    (sized ``max_concurrent_groups``). Staleness is bounded by the cut itself: a group can survive at
-    most ``ceil(trajectory_length / tokens_per_cut)`` cuts, and the per-step staleness metrics report it.
+    The controller admits at most ``max_concurrent_groups`` groups that are not yet trained on. It has
+    no staleness bound. Partial rollout cuts generation when ``mini_batch_size`` groups have finished,
+    trains, and resumes the cut groups under the new weights. A resumed group already holds a slot, so
+    the controller never blocks it.
+
+    A group holds its slot from submission until the step that trains on it
+    (``notify_capacity_change``). A finished group that waits in the buffer still holds its slot. If
+    the slot became free when generation finished, the workers would admit new groups past the cut.
+    The cut fraction would then differ from ``1 - mini_batch_size / max_concurrent_groups``, and the
+    finished groups could overflow the buffer of size ``max_concurrent_groups``.
+
+    The cut itself bounds the staleness. A group survives at most
+    ``ceil(trajectory_length / tokens_per_cut)`` cuts. The per-step staleness metrics report it.
     """
 
     def __init__(self, max_concurrent_groups: int, mini_batch_size: int):
@@ -246,8 +250,9 @@ class ConcurrencyAdmissionController(RolloutAdmissionController):
             )
 
     def _untrained_groups_unlocked(self) -> int:
-        # Running groups plus finished groups not yet trained on (in the buffer or in the mini-batch
-        # being collected). The steps before `_current_global_step` consumed `mini_batch_size` each.
+        # Count the running groups plus the finished groups that are not yet trained on. A finished
+        # group is in the buffer or in the mini-batch under collection. Each step before
+        # `_current_global_step` consumed `mini_batch_size` groups.
         consumed = (self._current_global_step - 1) * self.mini_batch_size
         return self._stat.running + self._stat.accepted - consumed
 
@@ -259,7 +264,7 @@ class ConcurrencyAdmissionController(RolloutAdmissionController):
             self._stat.running += 1
 
     async def on_rollout_accepted(self) -> None:
-        # The group moves from running to the buffer; its slot is held until it is trained on.
+        # The group moves from running to the buffer. It holds its slot until a step trains on it.
         async with self._cond:
             self._stat.accepted += 1
             self._stat.running -= 1

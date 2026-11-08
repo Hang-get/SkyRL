@@ -1,18 +1,22 @@
-"""Colocated partial rollout: cut generation when the mini-batch is full, train, resume the rest.
+"""The colocated partial-rollout trainer.
 
-Inference engines and the trainer share the GPUs, as in the synchronous trainer, but the step does
-not wait for every trajectory. ``num_parallel_generation_workers`` groups are kept in flight; once
-``policy_mini_batch_size`` of them have finished, the in-flight requests are aborted, the engines
-sleep, the trainer runs on the finished groups, the engines wake with the new weights, and the
-aborted requests continue from the tokens they had produced (see
-``RemoteInferenceClient.resume_aborted_requests``). The fraction of in-flight work that is cut
-each step is therefore ``1 - policy_mini_batch_size / num_parallel_generation_workers``.
+The inference engines and the trainer share the GPUs, as in the synchronous trainer. The step does
+not wait for every trajectory. The trainer keeps ``num_parallel_generation_workers`` groups in
+flight. When ``policy_mini_batch_size`` of them have finished, the step runs in this order:
 
-Compared with the fully-async trainer, there is no GPU split and no generation during training, so
-every mini-batch is at most a few cuts behind the current policy; compared with the synchronous
-trainer, the step no longer waits for the longest trajectory. Tokens produced before a cut carry the
-rollout logprobs of the older policy, so the loss must use rollout logprobs, which the base class
-asserts.
+1. The inference engines abort the in-flight requests and sleep.
+2. The trainer trains on the finished groups.
+3. The inference engines wake with the new weights.
+4. The aborted requests continue from the tokens they generated before the cut
+   (see ``RemoteInferenceClient.resume_aborted_requests``).
+
+Each step cuts the fraction ``1 - policy_mini_batch_size / num_parallel_generation_workers`` of the
+in-flight groups.
+
+Compared with the fully-async trainer, there is no GPU split and no generation during training. A
+mini-batch is at most a few cuts behind the current policy. Compared with the synchronous trainer,
+the step does not wait for the longest trajectory. Tokens generated before a cut carry the rollout
+logprobs of the older policy. The loss must use rollout logprobs, and the base class asserts this.
 """
 
 from loguru import logger
@@ -25,18 +29,18 @@ from skyrl.train.streaming.base import StreamingRayPPOTrainerBase
 
 
 class PartialRolloutRayPPOTrainer(StreamingRayPPOTrainerBase):
-    """Colocated streaming trainer. See the module docstring."""
+    """The colocated streaming trainer. See the module docstring."""
 
     checkpoint_before_weight_sync = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Aborted requests are held in the client and resubmitted after the weight sync, so the
-        # generator sees one uninterrupted completion per trajectory.
+        # The client holds each aborted request and resubmits it after the weight sync. The
+        # generator receives one completion per trajectory, as if no cut happened.
         self.inference_engine_client.resume_aborted_requests = True
 
     def _generation_buffer_maxsize(self) -> int:
-        # Every in-flight group can finish before the consumer drains the buffer.
+        # Every in-flight group can finish before the training loop drains the buffer.
         return self.num_parallel_generation_workers
 
     def _build_admission_controller(self) -> RolloutAdmissionController:
@@ -62,14 +66,15 @@ class PartialRolloutRayPPOTrainer(StreamingRayPPOTrainerBase):
         )
 
     async def _before_training_step(self) -> None:
-        # Abort the in-flight requests (the client holds them) and free the GPUs for training.
+        # The sleep aborts the in-flight requests, which the client holds, and frees the GPUs for training.
         await self.inference_engine_client.sleep()
 
     async def _sync_weights_after_training_step(self) -> None:
-        # Inherited transfer: with colocate_all the dispatch wakes the weights, broadcasts, and wakes
-        # the KV cache, which resumes the engines and releases the held requests.
+        # The inherited weight sync wakes the weights, broadcasts them, and wakes the key-value (KV)
+        # cache. The KV cache wake resumes the inference engines, and the client resubmits the held
+        # requests.
         await super()._sync_weights_after_training_step()
-        # By now every request this step's cut aborted has come back to the client and is held.
+        # At this point the client holds every request that this step's cut aborted.
         stats = self.inference_engine_client.pop_resume_stats()
         self.all_metrics.update({f"partial_rollout/{k}": v for k, v in stats.items()})
 
