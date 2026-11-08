@@ -875,7 +875,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         aborted and the client held), ``aborted_segment_tokens`` (tokens those requests had generated
         in the aborted segment), ``resume_prefill_tokens`` (prompt + generated tokens re-prefilled on
         resubmission) and ``retried_503`` (requests rejected by a paused engine and retried)."""
-        stats = {k: self._resume_stats.get(k, 0) for k in ("aborted_requests", "aborted_segment_tokens", "resume_prefill_tokens", "retried_503")}
+        stats = {
+            k: self._resume_stats.get(k, 0)
+            for k in ("aborted_requests", "aborted_segment_tokens", "resume_prefill_tokens", "retried_503")
+        }
         self._resume_stats.clear()
         return stats
 
