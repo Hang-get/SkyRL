@@ -36,7 +36,8 @@ class PartialRolloutPPOExp(BasePPOExp):
         )
 
 
-@ray.remote(num_cpus=1)
+# max_retries=0: fail once loudly instead of looping, so the crash is easy to read.
+@ray.remote(num_cpus=1, max_retries=0)
 def skyrl_entrypoint(cfg: SkyRLTrainConfig):
     # make sure that the training loop is not run on the head node.
     exp = PartialRolloutPPOExp(cfg)
