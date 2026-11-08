@@ -1,4 +1,4 @@
-"""The unit of work exchanged between generation workers and the training loop."""
+"""One finished group of rollouts. A generation worker produces it and the training loop consumes it."""
 
 from dataclasses import dataclass
 from typing import Any, List, Optional

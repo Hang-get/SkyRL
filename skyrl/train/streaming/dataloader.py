@@ -1,4 +1,4 @@
-"""Train dataloader wrapper shared by the streaming (per-group) trainers."""
+"""The train dataloader wrapper that the streaming trainers share. It hands out one prompt at a time."""
 
 import asyncio
 from typing import Iterable, List, Optional, Set

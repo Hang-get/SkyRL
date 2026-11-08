@@ -1,11 +1,11 @@
-"""Admission control for generation workers.
+"""Admission control for the generation workers.
 
-The training loop never submits a group to the inference engines without first acquiring a
-slot from a :class:`RolloutAdmissionController`. The controller decides *when* generation may
-run ahead of training, which is the one policy that differs between the fully-async trainer
-(a staleness budget, see :class:`AsyncStalenessManager`) and a colocated partial-rollout
-trainer (a cut fraction of the mini-batch). Everything else in the loop -- the worker tasks,
-the buffer, mini-batch collection, checkpointing -- is shared.
+A generation worker acquires a slot from a :class:`RolloutAdmissionController` before it submits a
+group to the inference engines. The controller decides when generation may run ahead of training.
+This decision is the only policy that differs between the streaming trainers. The fully-async
+trainer uses a staleness budget (:class:`AsyncStalenessManager`). A colocated partial-rollout
+trainer uses a cut fraction of the mini-batch. The worker tasks, the buffer, the mini-batch
+collection and the checkpointing are shared.
 """
 
 import asyncio
@@ -45,41 +45,44 @@ class RolloutStat:
 class RolloutAdmissionController(ABC):
     """Decides when a generation worker may submit the next group.
 
-    One group is one prompt generated ``n_samples_per_prompt`` times. The loop calls the methods in
-    this order for every group: :meth:`acquire_submission_slot` before generation starts, then
-    exactly one of :meth:`on_rollout_accepted` (the group reached the buffer),
-    :meth:`on_rollout_rejected` (generation was cancelled or failed), and later possibly
-    :meth:`on_rollout_filtered` (an accepted group was dropped from training). After every
-    training step the loop calls :meth:`notify_capacity_change` with the new global step.
+    A group is one prompt generated ``n_samples_per_prompt`` times. The training loop calls the
+    methods in this order for each group:
+
+    1. :meth:`acquire_submission_slot`, before generation starts.
+    2. Exactly one of :meth:`on_rollout_accepted` (the group reached the buffer) and
+       :meth:`on_rollout_rejected` (generation was cancelled or failed).
+    3. :meth:`on_rollout_filtered`, only when an accepted group is dropped from training.
+
+    After each training step the loop calls :meth:`notify_capacity_change` with the new global step.
     """
 
     @abstractmethod
     def load_state_from_checkpoint(self, global_step: int) -> None:
-        """Restore the controller to the state it had when ``global_step`` was about to be trained."""
+        """Restore the state the controller had when ``global_step`` was the next step to train."""
 
     @abstractmethod
     async def validate_state_at_epoch_end(self, global_step: int) -> None:
-        """Check the controller's accounting is consistent once all workers of an epoch have exited."""
+        """Check that the counters are consistent after all generation workers of an epoch have exited."""
 
     @abstractmethod
     async def acquire_submission_slot(self) -> None:
-        """Block until a group may be submitted, then reserve the slot."""
+        """Wait until the controller admits a new group, then reserve a slot for it."""
 
     @abstractmethod
     async def on_rollout_accepted(self) -> None:
-        """Release the slot of a group that finished generation and was buffered for training."""
+        """Record that a group finished generation and entered the buffer."""
 
     @abstractmethod
     async def on_rollout_filtered(self) -> None:
-        """Reclassify an accepted group as dropped from training."""
+        """Record that an accepted group was dropped from training."""
 
     @abstractmethod
     async def on_rollout_rejected(self) -> None:
-        """Release the slot of a group whose generation did not complete."""
+        """Free the slot of a group whose generation was cancelled or failed."""
 
     @abstractmethod
     async def notify_capacity_change(self, new_global_step: int) -> None:
-        """Advance the policy version after a training step, waking blocked workers."""
+        """Record the new global step after a training step and wake the workers that wait for a slot."""
 
 
 class AsyncStalenessManager(RolloutAdmissionController):

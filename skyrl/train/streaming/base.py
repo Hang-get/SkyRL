@@ -1,27 +1,28 @@
-"""Shared training loop for trainers that stream rollouts one group at a time.
+"""The training loop that the streaming trainers share.
 
-The fully-async trainer (https://docs.skyrl.ai/docs/tutorials/fully_async) is one such trainer; a
-colocated partial-rollout trainer is another. Both train on mini-batches of groups that finished
-under an older policy version, so they share this loop and differ only in the hooks below.
+A streaming trainer generates rollouts one group at a time and trains on each mini-batch of finished
+groups. A group is one prompt generated ``n_samples_per_prompt`` times. The fully-async trainer
+(https://docs.skyrl.ai/docs/tutorials/fully_async) is one streaming trainer. A colocated
+partial-rollout trainer is another. Both train on groups that finished under an older policy version.
+They differ only in the hooks listed below.
 
 :class:`StreamingRayPPOTrainerBase` owns everything that does not depend on where the inference
-engines live: the generation workers, the completed-group buffer, mini-batch collection,
-conversion to a training batch, checkpointing with consumed UIDs, metrics and the epoch
-bookkeeping. A subclass supplies the policy that does depend on it through a few hooks:
+engines run: the generation workers, the buffer of finished groups, the mini-batch collection, the
+conversion to a training batch, the checkpoint of consumed UIDs, the metrics, and the epoch
+bookkeeping. A subclass implements these hooks:
 
-- :meth:`_build_admission_controller`: when a worker may submit the next group (a staleness
-  budget for the disaggregated fully-async trainer; a cut fraction of the mini-batch for a
-  colocated partial-rollout trainer).
-- :meth:`_generation_buffer_maxsize`: the bound on completed groups the controller can have
-  buffered ahead of training.
-- :meth:`_validate_mode_config`: placement and capacity assertions.
-- :meth:`_before_training_step`: what happens to the engines before training (nothing when
-  generation keeps running on its own GPUs; pause-and-sleep when they share the trainer's).
-- :meth:`_sync_weights_after_training_step`: the weight-sync bracket (default: pause,
-  broadcast, resume); a colocated subclass wakes the engines and resubmits held requests.
-- :meth:`_after_training_loop`: engine teardown once training is done.
-- :attr:`checkpoint_before_weight_sync`: whether the step's checkpoint is written before the weight
-  sync (while colocated engines are still asleep and the trainer owns the GPUs) or after eval.
+- :meth:`_build_admission_controller` returns the controller that decides when a worker may submit
+  the next group. The fully-async trainer uses a staleness budget. A colocated partial-rollout
+  trainer uses a cut fraction of the mini-batch.
+- :meth:`_generation_buffer_maxsize` returns the largest number of finished groups the buffer holds.
+- :meth:`_validate_mode_config` checks the placement and capacity settings of the subclass.
+- :meth:`_before_training_step` runs after the mini-batch is collected and before training. The
+  default does nothing. A colocated subclass puts the inference engines to sleep.
+- :meth:`_sync_weights_after_training_step` pushes the new weights to the inference engines. The
+  default pauses generation, broadcasts the weights, and resumes generation.
+- :meth:`_after_training_loop` runs after the last epoch and before the final checkpoint.
+- :attr:`checkpoint_before_weight_sync` selects when the step writes its checkpoint: before the
+  weight sync, or after eval.
 
 High-level notes:
 - The global_step in each training loop iteration denotes the "current step being worked on", so
@@ -77,7 +78,7 @@ from skyrl.train.utils.trainer_utils import (
 
 
 class _StepOutcome(enum.Enum):
-    """What the step loop does after one iteration of :meth:`StreamingRayPPOTrainerBase._run_step`."""
+    """The action the step loop takes after one call of :meth:`StreamingRayPPOTrainerBase._run_step`."""
 
     CONTINUE = "continue"
     EPOCH_EXHAUSTED = "epoch_exhausted"
@@ -86,7 +87,7 @@ class _StepOutcome(enum.Enum):
 
 @dataclass
 class _EpochGeneration:
-    """The generation side of one epoch: the worker tasks and the buffer they fill."""
+    """The generation state of one epoch: the generation worker tasks and the buffer that they fill."""
 
     buffer: asyncio.Queue
     failure: BackgroundFailure
@@ -101,7 +102,9 @@ class _EpochGeneration:
         return tasks
 
     async def stop(self) -> None:
-        """Cancel the workers and the watcher, wait for them, then re-raise a recorded worker failure."""
+        """Cancel the generation workers and the watcher and wait for them to exit.
+
+        Then re-raise a recorded worker failure."""
         for t in self.generator_tasks:
             t.cancel()
         await asyncio.gather(*self.generator_tasks, return_exceptions=True)
@@ -112,13 +115,19 @@ class _EpochGeneration:
 
 
 class StreamingRayPPOTrainerBase(RayPPOTrainer):
-    """Streams rollouts one group at a time through ``num_parallel_generation_workers`` workers and
-    trains on every ``policy_mini_batch_size`` completed groups. Not a trainer by itself: see the module
-    docstring for the hooks a subclass implements. Reads its knobs from ``trainer.fully_async``."""
+    """The training loop that the streaming trainers share.
+
+    The trainer runs ``num_parallel_generation_workers`` generation workers. Each worker generates one
+    group at a time. The trainer trains on every ``policy_mini_batch_size`` finished groups. This class
+    is not a complete trainer. A subclass implements the hooks listed in the module docstring. The
+    settings come from ``trainer.fully_async``.
+    """
 
     checkpoint_before_weight_sync: bool = False
-    """Write the step's checkpoint before the weight sync instead of after eval. A colocated trainer
-    sets this: the checkpoint backloads the policy to GPU, which must happen while the engines sleep."""
+    """Write the step's checkpoint before the weight sync instead of after eval.
+
+    A colocated trainer sets this flag. The checkpoint loads the policy back to the GPUs, and this
+    must happen while the inference engines sleep."""
 
     def __init__(self, *args, **kwargs):
         # Extract cfg before base init so we can initialize async-specific knobs used by our overrides.
@@ -184,30 +193,35 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
         self._admission_controller = self._build_admission_controller()
 
     # ------------------------------------------------------------------
-    # Hooks. See the module docstring for which trainer overrides what.
+    # Hooks. The module docstring lists which trainer overrides each hook.
     # ------------------------------------------------------------------
 
     def _generation_buffer_maxsize(self) -> int:
-        """Upper bound on completed groups buffered ahead of training. Called before the base
-        trainer is initialized, so only ``self.mini_batch_size``, ``self.max_staleness_steps`` and
-        ``self.num_parallel_generation_workers`` are available."""
+        """Return the largest number of finished groups the buffer holds.
+
+        The base trainer calls this hook before its own initialization. Only ``self.mini_batch_size``,
+        ``self.max_staleness_steps`` and ``self.num_parallel_generation_workers`` are set at that time."""
         raise NotImplementedError
 
     def _build_admission_controller(self) -> RolloutAdmissionController:
-        """The policy deciding when a generation worker may submit the next group."""
+        """Return the controller that decides when a generation worker may submit the next group."""
         raise NotImplementedError
 
     def _validate_mode_config(self) -> None:
-        """Placement and capacity assertions specific to one trainer. Runs after the base trainer is
-        initialized, with ``self.cfg`` and ``self.colocate_all`` set."""
+        """Check the placement and capacity settings of the subclass.
+
+        The base trainer calls this hook after its initialization, so ``self.cfg`` and
+        ``self.colocate_all`` are set."""
 
     async def _before_training_step(self) -> None:
-        """Runs once the mini-batch is collected, before the forward/backward pass. Default: nothing;
-        generation keeps running on its own GPUs."""
+        """Run after the mini-batch is collected and before the forward and backward passes.
+
+        The default does nothing, because generation runs on its own GPUs."""
 
     async def _sync_weights_after_training_step(self) -> None:
-        """Push the new policy to the inference engines. The default brackets the transfer with the
-        dispatch's own pause and resume of generation."""
+        """Push the new weights to the inference engines.
+
+        The default lets the dispatch pause generation, transfer the weights, and resume generation."""
         async with self._weight_sync_deadline():
             with self._phase_gauge.timed_phase("sync_weights", self.all_timings):
                 await self.dispatch.save_weights_for_sampler()
@@ -218,19 +232,19 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
         self.all_timings.update(self.dispatch.get_timing_metrics())
 
     async def _after_training_loop(self) -> None:
-        """Runs after the last epoch, before the final checkpoint. Default: nothing."""
+        """Run after the last epoch and before the final checkpoint. The default does nothing."""
 
     # ------------------------------------------------------------------
-    # Compatibility aliases.
+    # Compatibility aliases for callers that use the old names.
     # ------------------------------------------------------------------
 
     @property
     def _staleness_manager(self) -> RolloutAdmissionController:
-        """Former name of :attr:`_admission_controller`."""
+        """The old name of :attr:`_admission_controller`."""
         return self._admission_controller
 
     # ------------------------------------------------------------------
-    # Shared loop.
+    # The shared loop.
     # ------------------------------------------------------------------
 
     def _build_callback_input(self, **fields) -> CallbackInput:
@@ -254,9 +268,9 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
         logger.info(f"Total training steps: {self.total_training_steps}")
 
     def _load_resume_state(self) -> Optional[int]:
-        """Restore global_step, the consumed UIDs and the admission controller from a checkpoint.
+        """Restore ``global_step``, the consumed UIDs and the admission controller from a checkpoint.
 
-        Returns the epoch to resume in, or None when starting fresh.
+        Return the epoch to resume in, or ``None`` when training starts from scratch.
         """
         resumed_start_epoch = None
         # Load checkpoint state if resumption is enabled. Also load the data UIDs that are already trained on.
@@ -382,8 +396,9 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
         logger.info("Training done!")
 
     def _start_epoch_generation(self) -> _EpochGeneration:
-        """Spawn this epoch's generation workers over a fresh buffer. Note that we do not do any
-        cross-epoch asynchrony here."""
+        """Start the generation workers of this epoch over a new buffer.
+
+        The loop has no asynchrony across epochs."""
         gen = _EpochGeneration(
             # Buffer of completed generation, size bounded by capacity - consumed = B * (max_staleness_steps + 1)
             buffer=asyncio.Queue[GeneratedOutputGroup](maxsize=self._gen_buffer_maxsize),
@@ -406,8 +421,9 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
         return gen
 
     async def _run_epoch(self, epoch: int, pbar: tqdm) -> bool:
-        """Train every mini-batch of one epoch. Returns True when training should stop early
-        (``max_training_steps`` reached)."""
+        """Train on every mini-batch of one epoch.
+
+        Return ``True`` when training reached ``max_training_steps`` and must stop."""
         self.epoch = epoch
         self._current_epoch = epoch
         self._fire("on_epoch_start")
@@ -452,8 +468,9 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
             raise
 
     async def _run_step(self, gen: _EpochGeneration, epoch: int, trained_steps_before: int, pbar: tqdm) -> _StepOutcome:
-        """One training step: collect a mini-batch, train, sync weights, eval, checkpoint, log.
+        """Run one training step.
 
+        The step collects a mini-batch, trains, syncs the weights, evaluates, checkpoints and logs.
         ``trained_steps_before`` is the number of steps already trained in this epoch.
         """
         async with self._step_deadline(), Timer("step", self.all_timings):
@@ -571,8 +588,10 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
         return _StepOutcome.CONTINUE
 
     async def _save_step_checkpoints(self, force_save: bool, is_epoch_end: bool) -> None:
-        """The step's checkpoint and HF export, each at its interval, at the last step of the epoch, or
-        when a callback asked for a save."""
+        """Write the step's checkpoint and its Hugging Face (HF) export.
+
+        The loop writes each one at its interval, at the last step of the epoch, or when a callback
+        requested a save."""
         ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
             is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
         )
@@ -588,9 +607,11 @@ class StreamingRayPPOTrainerBase(RayPPOTrainer):
                         await asyncio.to_thread(self.save_models)
 
     async def _discard_partial_epoch_end_batch(self, partial_batch: List[GeneratedOutputGroup], epoch: int) -> None:
-        """Exhausted mid mini-batch under ``sample_full_batch``: discard the partial batch (marked consumed
-        so it isn't regenerated on resume), and save the end-of-epoch checkpoint the normal
-        is_epoch_end path would have, since the step loop breaks before reaching it."""
+        """Discard a partial mini-batch at the end of an epoch under ``sample_full_batch``.
+
+        The loop marks the groups as consumed, so a resumed run does not generate them again. It then
+        writes the end-of-epoch checkpoint, because the step loop exits before the normal
+        ``is_epoch_end`` path."""
         if partial_batch:
             for _ in partial_batch:
                 await self._admission_controller.on_rollout_filtered()

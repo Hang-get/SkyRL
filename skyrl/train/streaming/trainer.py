@@ -1,4 +1,4 @@
-"""The fully-async trainer: inference engines on their own GPUs, generation never stops.
+"""The fully-async trainer. The inference engines run on their own GPUs and generation never stops.
 
 For details, see https://docs.skyrl.ai/docs/tutorials/fully_async.
 """
@@ -11,12 +11,16 @@ from skyrl.train.streaming.base import StreamingRayPPOTrainerBase
 
 
 class FullyAsyncRayPPOTrainer(StreamingRayPPOTrainerBase):
-    """Disaggregated fully-async PPO: generation runs continuously on dedicated inference GPUs,
-    bounded by :class:`AsyncStalenessManager` so no group is more than ``max_staleness_steps``
-    policy versions behind training, and the weight sync pauses and resumes the engines in place."""
+    """The disaggregated fully-async trainer.
+
+    Generation runs without pause on dedicated inference GPUs. :class:`AsyncStalenessManager` bounds
+    admission, so no group is more than ``max_staleness_steps`` policy versions behind training. The
+    weight sync pauses the inference engines, broadcasts the weights, and resumes the engines.
+    """
 
     def _generation_buffer_maxsize(self) -> int:
-        # Bounded by capacity - consumed = B * (max_staleness_steps + 1).
+        # The admission controller allows at most mini_batch_size * (max_staleness_steps + 1) finished
+        # groups ahead of training.
         return self.mini_batch_size * (self.max_staleness_steps + 1)
 
     def _build_admission_controller(self) -> RolloutAdmissionController:
@@ -38,7 +42,6 @@ class FullyAsyncRayPPOTrainer(StreamingRayPPOTrainerBase):
             "mini_batch_size <= num_parallel_generation_workers <= mini_batch_size * (max_staleness_steps + 1). Got: "
             f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}, {self.max_staleness_steps=}"
         )
-        # Generation and training overlap, so they need separate GPUs. A colocated variant (partial
-        # rollout: cut generation at a fraction of the mini-batch, train, resume under the new
-        # weights) is a sibling subclass of StreamingRayPPOTrainerBase, not a mode of this one.
+        # Generation and training overlap, so they need separate GPUs. A colocated trainer is a
+        # separate subclass of StreamingRayPPOTrainerBase, not a mode of this one.
         assert not self.colocate_all, "colocate_all is not supported for async training yet."
